@@ -237,13 +237,13 @@ void board_bootloader(struct udev_monitor *mon) {
 
 void board_up() {
 	press_up();
-	usleep(250 * MS);
+	usleep(50 * MS);
 	release_up();
 }
 
 void board_pwr() {
 	press_pwr();
-	usleep(250 * MS);
+	usleep(50 * MS);
 	release_pwr();
 }
 
@@ -535,6 +535,9 @@ int server_mainloop(const char *port)
 	int ret = 0;
 
 	memset(&addr, 0, sizeof(addr));
+
+	/* For journalctl */
+	setvbuf(stdout, NULL, _IONBF, 0);
 
 	ttyfd = tp_open(port, reconnect_handler, (void*)port, 0);
 	if(ttyfd == -1) {

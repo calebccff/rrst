@@ -15,23 +15,39 @@ releasing the pins.
 ## Usage
 
 ```txt
-rrst (-s /dev/ttyUSB0|reset|bootloader|up|pwr)
+rrst (-s /dev/ttyUSB0|reset|bootloader|up|pwr|pty|baud)
         -s             : run daemon on a given port
         reset          : reset the board
         bootloader     : enter bootloader mode
         up             : press the up button (serial RTS pin)
         pwr            : press the power button (serial DTR pin)
         release        : release all buttons
+        pty            : get the pty path for your serial console
+        baud           : toggle the serial baud manually (115200/3000000)
 ```
 
-## Running alongside a serial program
+## Running a serial monitor
 
-Ensure your program doesn't lock the TTY device, and that it avoids touching the
-RTS and DTR lines. I use `picocom` with the following arguments:
+To implement smooth baud rate changes, and workaround the FTDI quirk, rrst
+provides a passthrough terminal on a pty. As a bonus, this uses
+[ttypersist](https://github.com/russdill/ttypersist), which caches serial port
+configuration and hides disconnect/reconnect events, so you can safely
+detach/reattach your serial adapter without your monitor program disconnecting.
 
-```bash
-picocom -l --noinit --noreset --lower-rts --lower-dtr
+The pty path can be retrieved with `rrst pty`, this can be integrated into a oneliner like:
+
+```sh
+picocom $(rrst pty)
 ```
+
+## Baud rates
+
+FIXME: currently the baud rates are hardcoded, 115200 when in the bootloader and
+3000000 in Linux. The bootloader -> Linux transition is detected by string
+matching against "UEFI end", the string in Qcom bootloadlers. Linux ->
+bootloader transition is triggered by the rrst `reset` and `bootloader`
+commands. The baud rate can be toggle with `rrst baud`, I recommend configuring
+these as global shortcuts in your window manager or DE.
 
 ## Wiring
 
@@ -42,11 +58,17 @@ in the serial adapter from interfering with normal usage.
 ## Compilation
 
 ```bash
-make rrst
+meson setup build
+meson compile -C build
+```
+
+Install with
+
+```sh
+sudo meson install -C build
 ```
 
 ## Systemd services
 
-The `uart.path` and `rrstwatch.service` units can be installed as systemd user
-services by symlinking to `/etc/xdg/systemd/user/`, enable `uart.path` to have
-`rrst` automatically launch in the background whenever `ttyUSB0` is available.
+RRST provides a user service to run the daemon, you can configure the serial
+port in `$HOME/.config/rrst.conf`, see the default config in this repo.
