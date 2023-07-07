@@ -1,0 +1,12 @@
+[Unit]
+Description=UART RTS/DTR button control
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rrst
+ExecStop=killall rrst
+Restart=always
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
