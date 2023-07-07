@@ -498,7 +498,7 @@ int handle_tty(int fd)
 
 	tty_line[tty_line_len++] = buf;
 	if (buf == '\n' || buf == '\r') {
-		if (strstr(tty_line, LINUX_TRANSITION)) {
+		if (current_baud == B115200 && strstr(tty_line, LINUX_TRANSITION)) {
 			printf("Linux transition detected\n");
 			set_baud(B3000000, false);
 			set_baud(B3000000, false);
