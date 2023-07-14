@@ -67,8 +67,6 @@ static const struct termios tty_std_termios = {
 		   ECHOCTL | ECHOKE | IEXTEN,
 	.c_cc = INIT_C_CC,
 	.c_line = 0,
-	.c_ispeed = 9600,
-	.c_ospeed = 9600,
 };
 
 static void *persist_thread(void *arg)
