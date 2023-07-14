@@ -1,4 +1,6 @@
 #!/bin/sh
 
-install -Dm644 -t config/axolotl.ini /etc/rrst/axolotl.ini
-install -Dm644 -t config/rb3.ini /etc/rrst/rb3.ini
+SCRIPTDIR="$(dirname "$(readlink -f "$0")")"
+
+install -Dm644 "$SCRIPTDIR"/config/axolotl.ini "$DESTDIR"/etc/rrst/axolotl.ini
+install -Dm644 "$SCRIPTDIR"/config/rb3.ini "$DESTDIR"/etc/rrst/rb3.ini
