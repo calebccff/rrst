@@ -3,11 +3,15 @@ project('rrst', 'c')
 deps = [
     dependency('threads'),
     dependency('libudev'),
+    dependency('inih')
 ]
 
 src = [
     'rrst.c',
     'ttypersist.c',
+    'config.c',
+    'control_rtsdtr.c',
+    'control_qcomdbg.c'
 ]
 
 executable('rrst', src,

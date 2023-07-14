@@ -16,7 +16,6 @@
 #include <sys/poll.h>
 #include <signal.h>
 #include <stdbool.h>
-#include <termios.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -24,16 +23,20 @@
 
 #include <libudev.h>
 
+#include "rrst.h"
 #include "ttypersist.h"
+#include "control.h"
+#include "config.h"
 
 #define SOCK_PATH "/run/user/%d/rrst-%d.sock"
 #define SERVER 0
 #define CLIENT 1
-#define MS 1000
 
 void usage() {
-	fprintf(stderr, "Usage: rrst (-s /dev/ttyUSB0|reset|bootloader|up|pwr|pty|baud)\n");
-	fprintf(stderr, "\t-s             : run daemon on a given port\n");
+	fprintf(stderr, "Usage: rrst [-d [-s SOCKET] -c CONFIG_PATH]|[COMMAND]\n");
+	fprintf(stderr, "       rrst (reset|bootloader|up|pwr|pty|baud)\n");
+	fprintf(stderr, "\t-d             : run daemon\n");
+	fprintf(stderr, "\t-c             : path to device config\n");
 	fprintf(stderr, "\treset          : reset the board\n");
 	fprintf(stderr, "\tbootloader     : enter bootloader mode\n");
 	fprintf(stderr, "\tup             : press the up button (serial RTS pin)\n");
@@ -43,18 +46,6 @@ void usage() {
 	fprintf(stderr, "\tbaud           : toggle the serial baud manually (115200/3000000)\n");
 }
 
-enum actions {
-	INVALID = 0,
-	RESET,
-	BOOTLOADER,
-	UP,
-	PWR,
-	RELEASE,
-	QUIT,
-	PTY,
-	BAUD,
-};
-
 static const char *action_names[] = {
 	[INVALID] = "invalid",
 	[RESET] = "reset",
@@ -63,27 +54,7 @@ static const char *action_names[] = {
 	[PWR] = "pwr",
 	[RELEASE] = "release",
 	[PTY] = "pty",
-	[QUIT] = "quit",
 	[BAUD] = "baud",
-};
-
-enum rrst_msg_type {
-	/* Client -> Server */
-	MSG_ACTION = 1,
-
-	/* Server -> Client */
-	MSG_ACK,
-	MSG_INFO,
-	MSG_ERR,
-};
-
-struct rrst_msg {
-	enum rrst_msg_type type;
-	bool block; /* Don't send ACK until sequence is complete */
-	union {
-		enum actions action;
-		char info[64];
-	};
 };
 
 struct rrst_action_state {
@@ -100,40 +71,21 @@ struct rrst_action_state {
 #define NOTIFY_QUIT 0xff
 #define NOTIFY_PTY_DISCONNECT 0x01
 
-static int ttyfd, notifyfd, ptyfd, rts = TIOCM_RTS, dtr = TIOCM_DTR;
+int ttyfd;
+bool quit;
+static int notifyfd, ptyfd;
 static char socket_path[PATH_MAX];
-static bool quit = false, serial_attached = false;
 static speed_t current_baud;
+static struct rrst_config config;
+static struct rrst_control control;
 
 #define CURRENT_BAUD_STR (current_baud == B115200 ? "115200" : "3000000")
-
-#define btn_pwr (dtr) // set to press
-#define btn_up (rts) // clear to press
-
-#define btn_name(btn) (btn == btn_pwr ? "power" : "up")
 
 int die(const char *msg)
 {
 	perror(msg);
 	exit(EXIT_FAILURE);
 }
-
-void press_btn(int btn) {
-	if (!serial_attached) return;
-	if (!quit) printf("%s: press\n", btn_name(btn));
-	tp_ioctl(ttyfd, TIOCMBIS, &btn);
-}
-
-void release_btn(int btn) {
-	if (!serial_attached) return;
-	if (!quit) printf("%s: release\n", btn_name(btn));
-	tp_ioctl(ttyfd, TIOCMBIC, &btn);
-}
-
-#define press_pwr() press_btn(btn_pwr)
-#define press_up() press_btn(btn_up)
-#define release_pwr() release_btn(btn_pwr)
-#define release_up() release_btn(btn_up)
 
 int _set_baud(int fd, speed_t speed, bool make_raw)
 {
@@ -157,33 +109,15 @@ int _set_baud(int fd, speed_t speed, bool make_raw)
 	return 0;
 }
 
-int set_baud(speed_t speed, bool make_raw)
+static int set_baud(speed_t speed, bool make_raw)
 {
 	return _set_baud(ttyfd, speed, make_raw)
 	    || _set_baud(ptyfd, speed, make_raw);
 }
 
-void start_reset_set_baud()
-{
-	press_pwr();
-	press_up();
-	usleep(10000 * MS);
-	set_baud(B115200, false);
-	set_baud(B115200, false);
-	usleep(2500 * MS);
-}
-
-// Hold power and volume up for 10.5 seconds
-// release volume up and hold power for 1.5 seconds
-void board_reset() {
-	start_reset_set_baud();
-	release_up();
-	release_pwr();
-}
-
 #define FASTBOOT_PATH "/dev/android_fastboot"
 
-bool device_is_fastboot(struct udev_device *dev) {
+static bool device_is_fastboot(struct udev_device *dev) {
 	struct udev_list_entry *devlinks, *link;
 	devlinks = udev_device_get_devlinks_list_entry(dev);
 
@@ -199,13 +133,14 @@ bool device_is_fastboot(struct udev_device *dev) {
 
 // Hold power and volume up for 12.5 seconds
 // Keep holding until fastboot device detected (:
-void board_bootloader(struct udev_monitor *mon) {
+static void board_bootloader(struct udev_monitor *mon, struct rrst_msg *msg) {
 	int fd;
-	start_reset_set_baud();
+	control.start_bootloader(msg);
+	set_baud(config.baud_bootloader, false);
 	udev_monitor_enable_receiving(mon);
 	fd = udev_monitor_get_fd(mon);
 	/* Wait until fastboot device detected, or timeout */
-	struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
+	struct timeval tv = { .tv_sec = 300, .tv_usec = 0 };
 	fd_set fds;
 
 	FD_ZERO(&fds);
@@ -231,36 +166,14 @@ void board_bootloader(struct udev_monitor *mon) {
 			udev_device_unref(dev);
 		}
 	}
-	release_pwr();
-	release_up();
+	control.release(msg);
 }
 
-void board_up() {
-	press_up();
-	usleep(50 * MS);
-	release_up();
-}
-
-void board_pwr() {
-	press_pwr();
-	usleep(50 * MS);
-	release_pwr();
-}
-
-void get_pty(int *fd)
-{
-	(*fd) = open("/dev/ptmx", O_RDWR);
-	if (grantpt((*fd)))
-		die("grantpt");
-
-	if (unlockpt((*fd)))
-		die("unlockpt");
-}
-
-void sigterm_handler(int signum) {
+static void sigterm_handler(int signum) {
 	quit = true;
-	release_pwr();
-	release_up();
+	control.release(NULL);
+	if (control.exit)
+		control.exit();
 	int x = NOTIFY_QUIT;
 	send(notifyfd, &x, sizeof(x), 0);
 	unlink(socket_path);
@@ -268,16 +181,11 @@ void sigterm_handler(int signum) {
 }
 
 /* Called on every connect including the first one */
-void reconnect_handler(void *priv, int fd) {
-	serial_attached = fd > 0;
-	if (serial_attached) {
-		printf("Reconnected to %s\n", (char *)priv);
-		release_pwr();
-		release_up();
-	}
+static void reconnect_handler(void *priv, int fd) {
+	control.on_connect(fd > 0);
 }
 
-enum actions parse_action(const char *action_str)
+static enum actions parse_action(const char *action_str)
 {
 	for (int i = 1; i < sizeof(action_names) / sizeof(action_names[0]); i++) {
 		if (strcmp(action_names[i], action_str) == 0) {
@@ -294,7 +202,7 @@ struct rrst_sock {
 	struct sockaddr_un client_addr;
 };
 
-int init_socket(int *fd, struct sockaddr_un *addr)
+static int init_socket(int *fd, struct sockaddr_un *addr)
 {
 	*fd = socket(PF_UNIX, SOCK_DGRAM, 0);
 	if (*fd == -1) {
@@ -308,7 +216,7 @@ int init_socket(int *fd, struct sockaddr_un *addr)
 	return 0;
 }
 
-int bind_socket(int fd, struct sockaddr_un *addr)
+static int bind_socket(int fd, struct sockaddr_un *addr)
 {
 	if (bind(fd, (struct sockaddr *)addr, sizeof(*addr)) == -1) {
 		if (errno == EADDRINUSE)
@@ -322,17 +230,7 @@ int bind_socket(int fd, struct sockaddr_un *addr)
 	return 0;
 }
 
-int connect_socket(int fd, struct sockaddr_un *addr)
-{
-	if (connect(fd, (struct sockaddr *)addr, sizeof(*addr)) == -1) {
-		fprintf(stderr, "Failed to connect to socket: %s\n", strerror(errno));
-		return -1;
-	}
-
-	return 0;
-}
-
-void *server_action_thread(void *data) {
+static void *server_action_thread(void *data) {
 	struct rrst_action_state *state = data;
 	struct rrst_msg msg;
 	struct udev *udev;
@@ -357,13 +255,6 @@ void *server_action_thread(void *data) {
 		pthread_mutex_lock(&state->mutex);
 		pthread_cond_wait(&state->newaction, &state->mutex);
 
-		if (!serial_attached && state->action != PTY) {
-			fprintf(stderr, "No serial port attached!\n");
-			msg.type = MSG_ERR;
-			strncpy(msg.info, "ERROR: No serial port attached!", sizeof(msg.info) - 1);
-			goto respond;
-		}
-
 		switch (state->action) {
 		case INVALID:
 			fprintf(stderr, "Invalid action!\n");
@@ -371,36 +262,22 @@ void *server_action_thread(void *data) {
 			strncpy(msg.info, "ERROR: Invalid action", sizeof(msg.info) - 1);
 			break;
 		case RESET:
-			board_reset();
-			msg.type = MSG_ACK;
+			control.reset(&msg);
 			break;
 		case BOOTLOADER:
-			board_bootloader(monitor);
-			msg.type = MSG_ACK;
+			board_bootloader(monitor, &msg);
 			break;
 		case UP:
-			board_up();
-			msg.type = MSG_ACK;
+			control.up(&msg);
 			break;
 		case PWR:
-			board_pwr();
-			msg.type = MSG_ACK;
+			control.pwr(&msg);
 			break;
 		case RELEASE:
-			release_pwr();
-			release_up();
-			msg.type = MSG_ACK;
-			break;
-		case QUIT:
-			release_pwr();
-			release_up();
-			msg.type = MSG_ACK;
-		case PTY:
-			msg.type = MSG_INFO;
-			strncpy(msg.info, state->ptyname, sizeof(msg.info) - 1);
+			control.release(&msg);
 			break;
 		case BAUD:
-			if (set_baud(current_baud == B115200 ? B3000000 : B115200, false)) {
+			if (set_baud(current_baud == config.baud_linux ? config.baud_bootloader : config.baud_linux, false)) {
 				msg.type = MSG_ERR;
 				snprintf(msg.info, sizeof(msg.info) - 1, "ERROR: failed to set baud: %s", strerror(errno));
 			} else {
@@ -409,21 +286,13 @@ void *server_action_thread(void *data) {
 			}
 			break;
 		default:
-			fprintf(stderr, "Fell through!!!\n");
+			fprintf(stderr, "Fell through!!! %d\n", state->action);
 			break;
 		}
 
-respond:
 		if (sendto(state->fd, &msg, sizeof(msg), 0, (struct sockaddr*)&state->addr_client, addrlen) < 0)
 			fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
 		pthread_mutex_unlock(&state->mutex);
-
-		if (state->action == QUIT) {
-			quit = true;
-			notify = 0xff;
-			write(notifyfd, &notify, sizeof(notify));
-			break;
-		}
 	}
 
 	udev_monitor_unref(monitor);
@@ -431,7 +300,7 @@ respond:
 	return NULL;
 }
 
-int handle_action(const char *port, struct rrst_action_state *state)
+static int handle_action(const char *port, struct rrst_action_state *state)
 {
 	int len, ret;
 	struct rrst_msg msg;
@@ -454,6 +323,16 @@ int handle_action(const char *port, struct rrst_action_state *state)
 		return -1;
 	}
 
+	printf("Handling action: '%s'\n", action_names[action]);
+
+	if (action == PTY) {
+		msg.type = MSG_INFO;
+		strncpy(msg.info, state->ptyname, sizeof(msg.info) - 1);
+		if (sendto(state->fd, &msg, sizeof(msg), 0, (struct sockaddr*)&state->addr_client, addrlen) < 0)
+			fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
+		return 0;
+	}
+
 	if ((ret = pthread_mutex_trylock(&state->mutex)) == EBUSY) {
 		msg.type = MSG_ERR;
 		strncpy(msg.info, "ERROR: Action already in progress", sizeof(msg.info) - 1);
@@ -461,13 +340,12 @@ int handle_action(const char *port, struct rrst_action_state *state)
 			fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
 	}
 
-	if (ret) {
+	if (ret && ret != EBUSY) {
 		fprintf(stderr, "Failed to lock mutex: %s\n", strerror(ret));
 		quit = true;
 		return -1;
 	}
 
-	printf("Handling action: '%s'\n", action_names[action]);
 	state->action = action;
 
 	pthread_cond_broadcast(&state->newaction);
@@ -478,7 +356,7 @@ int handle_action(const char *port, struct rrst_action_state *state)
 
 #define LINUX_TRANSITION "UEFI End"
 
-int handle_tty(int fd)
+static int handle_tty(int fd)
 {
 	static char tty_line[4096];
 	static int tty_line_len = 0;
@@ -498,10 +376,9 @@ int handle_tty(int fd)
 
 	tty_line[tty_line_len++] = buf;
 	if (buf == '\n' || buf == '\r') {
-		if (current_baud == B115200 && strstr(tty_line, LINUX_TRANSITION)) {
+		if (current_baud == config.baud_bootloader && strstr(tty_line, LINUX_TRANSITION)) {
 			printf("Linux transition detected\n");
-			set_baud(B3000000, false);
-			set_baud(B3000000, false);
+			set_baud(config.baud_linux, false);
 		}
 		memset(tty_line, 0, sizeof(tty_line));
 		tty_line_len = 0;
@@ -520,7 +397,7 @@ int handle_tty(int fd)
 	return 0;
 }
 
-int server_mainloop(const char *port)
+static int server_mainloop(const char *config_path)
 {
 	struct sigaction sigterm_action = {
 		.sa_handler = sigterm_handler,
@@ -535,28 +412,48 @@ int server_mainloop(const char *port)
 	int ret = 0;
 
 	memset(&addr, 0, sizeof(addr));
-
 	/* For journalctl */
 	setvbuf(stdout, NULL, _IONBF, 0);
 
-	ttyfd = tp_open(port, reconnect_handler, (void*)port, 0);
+	if (rrst_load_config(config_path, &config)) {
+		fprintf(stderr, "Failed to load config file: %s\n", config_path);
+		return 1;
+	}
+
+	switch (config.control_method) {
+		case RRST_CONTROL_RTS_DTR:
+			control = rts_dtr_control;
+			break;
+		case RRST_CONTROL_QCOM_DBG:
+			control = qcom_dbg_control;
+			break;
+		default:
+			fprintf(stderr, "Invalid control method: %d\n", config.control_method);
+			return 1;
+	}
+
+	if (control.init && control.init(&config)) {
+		fprintf(stderr, "Failed to initialize control method\n");
+		return 1;
+	}
+
+	printf("Using port: %s\n", config.port);
+
+	ttyfd = tp_open(config.port, reconnect_handler, (void*)config.port, 0);
 	if(ttyfd == -1) {
-		fprintf(stderr, "Error! opening %s\n", port);
+		fprintf(stderr, "Error! opening %s\n", config.port);
 		return errno;
 	}
 
 	ret = tp_flock(ttyfd, LOCK_EX);
 	if (ret < 0) {
 		if (errno == EWOULDBLOCK) {
-			fprintf(stderr, "Error: Can't lock %s, another process is using it\n", port);
+			fprintf(stderr, "Error: Can't lock %s, another process is using it\n", config.port);
 			//return errno;
 		}
 
 		fprintf(stderr, "Error: flock() failed: %s\n", strerror(errno));
 	}
-
-	release_pwr();
-	release_up();
 
 	if (init_socket(&state.fd, &addr) < 0)
 		return 1;
@@ -610,8 +507,8 @@ int server_mainloop(const char *port)
 
 	printf("Using pty: %s\n", state.ptyname);
 
-	set_baud(B115200, true);
-	set_baud(B115200, true);
+	printf("Setting baud to bootloader rate: %d\n", config.baud_bootloader);
+	set_baud(config.baud_bootloader, true);
 
 	if (pthread_create(&state.thread, NULL, server_action_thread, &state)) {
 		fprintf(stderr, "Failed to create thread: %s\n", strerror(errno));
@@ -640,7 +537,7 @@ int server_mainloop(const char *port)
 		/* state.fd */
 		if (fds[0].revents & POLLIN) {
 			printf("state.fd\n");
-			if (handle_action(port, &state) < 0) {
+			if (handle_action(config.port, &state) < 0) {
 				ret = 1;
 				goto out;
 			}
@@ -661,7 +558,7 @@ int server_mainloop(const char *port)
 				quit = true;
 				break;
 			case NOTIFY_PTY_DISCONNECT:
-				printf("%s: %s\n", port, "Disconnected");
+				printf("%s: %s\n", config.port, "Disconnected");
 				break;
 			default:
 				fprintf(stderr, "Unknown notification: %lu\n", notify);
@@ -703,19 +600,33 @@ out:
 	return ret;
 }
 
-int do_action(enum actions action) 
+static void client_sigterm_handler(int sig)
+{
+	unlink(socket_path);
+	quit = true;
+	close(notifyfd);
+}
+
+static int do_action(enum actions action) 
 {
 	struct rrst_msg msg;
-	int fd;
 	struct sockaddr_un addr;
 	struct sockaddr_un addr_client;
 	struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-	int len;
+	int len = 0;
+	struct sigaction sigterm_action = {
+		.sa_handler = client_sigterm_handler,
+		.sa_flags = 0,
+	};
 
 	memset(&addr, 0, sizeof(addr));
 	memset(&addr_client, 0, sizeof(addr_client));
 
-	if (init_socket(&fd, &addr) < 0)
+	//sigemptyset(&sigterm_action.sa_mask);
+	sigaction(SIGTERM, &sigterm_action, NULL);
+	sigaction(SIGINT, &sigterm_action, NULL);
+
+	if (init_socket(&notifyfd, &addr) < 0)
 		return 1;
 
 	addr_client.sun_family = AF_UNIX;
@@ -724,41 +635,37 @@ int do_action(enum actions action)
 
 	//fprintf(stderr, "Using socket: %s\n", socket_path);
 
-	if (bind_socket(fd, &addr_client) < 0) {
-		close(fd);
+	if (bind_socket(notifyfd, &addr_client) < 0) {
+		close(notifyfd);
 		if (errno != EADDRINUSE)
 			unlink(socket_path);
 		return 1;
 	}
 
-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+	if (connect(notifyfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
 		fprintf(stderr, "RRST: Failed to connect to socket: %s\n", strerror(errno));
-		close(fd);
-		unlink(socket_path);
-		return -1;
+		goto out;
 	}
 
-	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+	if (setsockopt(notifyfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
 		fprintf(stderr, "RRST: Failed configure socket timeout: %s\n", strerror(errno));
-		close(fd);
-		unlink(socket_path);
-		return 1;
+		goto out;
 	}
 
 	memset(&msg, 0, sizeof(msg));
 	msg.type = MSG_ACTION;
 	msg.action = action;
 
-	if (send(fd, &msg, sizeof(msg), 0) == -1) {
+	if (send(notifyfd, &msg, sizeof(msg), 0) == -1) {
 		fprintf(stderr, "RRST: Failed to send message, is rrst running? %s\n", strerror(errno));
-		close(fd);
-		unlink(socket_path);
-		return 1;
+		goto out;
 	}
 
 	memset(&msg, 0, sizeof(msg));
-	while ((len = recv(fd, &msg, sizeof(msg), 0)) == -1 && (errno == EINTR || errno == EAGAIN)) {
+	while ((len = recv(notifyfd, &msg, sizeof(msg), 0)) == -1 && (errno == EINTR || errno == EAGAIN)) {
 		usleep(1 * MS);
+		if (quit)
+			goto out;
 	}
 	if (len == -1) {
 		fprintf(stderr, "RRST: Failed to receive message, is rrst running? %s\n", strerror(errno));
@@ -781,7 +688,7 @@ int do_action(enum actions action)
 	}
 
 out:
-	close(fd);
+	close(notifyfd);
 	unlink(socket_path);
 	return len > 0 ? 0 : 1;
 }
@@ -791,11 +698,15 @@ int main(int argc, char *argv[])
 	enum actions action = INVALID;
 
 	int opt;
-	char *port = NULL;
-	while ((opt = getopt(argc, argv, "s:h")) != -1) {
+	bool daemon = false;
+	const char *config_path = NULL;
+	while ((opt = getopt(argc, argv, "dc:h")) != -1) {
 		switch (opt) {
-		case 's':
-			port = optarg;
+		case 'd':
+			daemon = true;
+			break;
+		case 'c':
+			config_path = optarg;
 			break;
 		case 'h':
 			usage();
@@ -806,22 +717,30 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	// Invoke an action
-	if (optind < argc) {
-		if (port) {
-			fprintf(stderr, "Can't specify an action and a TTY device.\n");
+	quit = false;
+
+	if (daemon) {
+		if (!config_path) {
+			fprintf(stderr, "Must specify a config file for the daemon.\n");
 			return 1;
 		}
+
+		if (optind < argc) {
+			fprintf(stderr, "Can't specify an action and a config file.\n");
+			return 1;
+		}
+
+		return server_mainloop(config_path);
+	}
+
+	// Invoke an action (client)
+	if (optind < argc) {
 		action = parse_action(argv[optind++]);
-	} else if (!port) {
+	} else {
 		fprintf(stderr, "No arguments specified!\n");
 		usage();
 		return 1;
-	} else {
-		/* Spawn server */
-		return server_mainloop(port);
 	}
 
-	/* Client */
 	return do_action(action);
 }
