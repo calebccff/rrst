@@ -20,3 +20,5 @@ executable('rrst', src,
     install: true)
 
 install_data('rrst.service', rename: '/usr/lib/systemd/user/rrst.service')
+
+meson.add_install_script('install.sh')
