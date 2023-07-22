@@ -11,6 +11,7 @@
 static const char *control_port;
 static bool control_port_attached = false;
 static int cfd = -1;
+static enum qcom_dbg_type qcom_dbg_type;
 
 #define write_byte(b) if (write(cfd, b, 1) != 1) RRST_MSG_ERR_RET(msg, "ERROR: failed to write '" b "' to control port\n")
 
@@ -34,6 +35,7 @@ static void control_port_reconnect(void *data, int fd) {
 
 static int qcom_dbg_init(struct rrst_config *config) {
 	control_port = config->control_port;
+	qcom_dbg_type = config->qcom_dbg_type;
 
 	cfd = tp_open(control_port, control_port_reconnect, NULL, 0);
 	if (cfd == -1) {
@@ -68,12 +70,22 @@ static int qcom_dbg_release_btns(struct rrst_msg *msg) {
 
 /* No fiddling with button combos \o/ */
 static int qcom_dbg_board_reset(struct rrst_msg *msg) {
-	disable_power();
-	disable_vbus();
-	usleep(300 * MS);
-	enable_power();
-	usleep(10 * MS);
-	enable_vbus();
+	switch (qcom_dbg_type) {
+	case QCOM_DBG_TYPE_NORMAL:
+		disable_power();
+		disable_vbus();
+		usleep(300 * MS);
+		enable_power();
+		usleep(10 * MS);
+		enable_vbus();
+		break;
+	case QCOM_DBG_TYPE_NOPWR:
+		// For boards without power control, do it the hard way
+		press_pwr();
+		press_up();
+		usleep(10500 * MS);
+		break;
+	}
 
 	RRST_MSG_ACK(msg);
 }

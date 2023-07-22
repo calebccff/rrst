@@ -34,6 +34,24 @@ do { \
 	} \
 } while (0)
 
+#define load_enum_key_or_ret(key, str_enum_fn) \
+do { \
+	if (strcmp(name, #key) == 0) { \
+		if (str_enum_fn(&config->key, value)) { \
+			fprintf(stderr, "Unknown %s: %s\n", name, value); \
+			return 1; \
+		} \
+	} \
+} while (0)
+
+static int qcom_dbg_type_to_str(int *out, const char *str) {
+	if (!strcmp(str, "QCOM_DBG_TYPE_NORMAL"))
+		return !(*out = QCOM_DBG_TYPE_NORMAL);
+	if (!strcmp(str, "QCOM_DBG_TYPE_NOPWR"))
+		return !(*out = QCOM_DBG_TYPE_NOPWR);
+
+	return 1;
+}
 
 static int config_handler(void *ud, const char *section, const char *name,
 			  const char *value)
@@ -50,6 +68,7 @@ static int config_handler(void *ud, const char *section, const char *name,
 	load_baud_key_or_ret(baud_linux);
 	load_key_or_ret(linux_detect);
 	load_key_or_ret(control_port);
+	load_enum_key_or_ret(qcom_dbg_type, qcom_dbg_type_to_str);
 
 	if (strcmp(name, "control_method") == 0) {
 		if (strcmp(value, "rts_dtr") == 0) {

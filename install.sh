@@ -2,5 +2,6 @@
 
 SCRIPTDIR="$(dirname "$(readlink -f "$0")")"
 
-install -Dm644 "$SCRIPTDIR"/config/axolotl.ini "$DESTDIR"/etc/rrst/axolotl.ini
-install -Dm644 "$SCRIPTDIR"/config/rb3.ini "$DESTDIR"/etc/rrst/rb3.ini
+for x in "$SCRIPTDIR"/config/*; do
+	install -Dm644 $x "$DESTDIR"/etc/rrst/
+done
