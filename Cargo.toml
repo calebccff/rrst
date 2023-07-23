@@ -1,0 +1,16 @@
+[package]
+name = "pts"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "pts"
+crate-type = ["cdylib"]
+path = "pts.rs"
+
+[build-dependencies]
+cbindgen = "0.24.3"
+
+[dependencies]
+

@@ -1,5 +1,3 @@
-/* From https://github.com/freedomlives/RTS-DTR-Pin-Control-Linux/blob/master/serial_rts_dtr.c */
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <fcntl.h>
@@ -27,6 +25,7 @@
 #include "ttypersist.h"
 #include "control.h"
 #include "config.h"
+#include "pts_api.h"
 
 #define SOCK_PATH "/run/user/%d/rrst-%d.sock"
 #define SERVER 0
@@ -696,6 +695,8 @@ out:
 int main(int argc, char *argv[])
 {
 	enum actions action = INVALID;
+
+	printf("Got out %d\n", pts_rs_test(5));
 
 	int opt;
 	bool daemon = false;
