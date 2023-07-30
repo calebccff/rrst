@@ -1,30 +1,12 @@
-# Rts ReSeT
+# Remote ReSeT
 
-Use the RTS and DTR# pins of a UART adapter to control qualcomm boards.
+RRST is a daemon for controlling an individual board via either the RTS and DTR
+pins of a standard USB->UART adapter, or via an external MCU implementing the
+[CDBA](https://github.com/andersson/cdba) control interface.
 
 RRST expects your board to have a power button and a  "bootloader mode" button
 (usually volume up). You should attach these to the DTR# and RTS pins
 respectively, ideally though a ~10k+ resister (4.7k will do fine).
-
-The reason for the user service is a workaround for the FTDI Linux drivers as
-they will unconditionally reset the RTS and DTR# pins when you call `open()` on
-the serial device... Simiarly when attaching the device the pins are reset. The
-service handles this by opening the device as soon as it's available and
-releasing the pins.
-
-## Usage
-
-```txt
-rrst (-s /dev/ttyUSB0|reset|bootloader|up|pwr|pty|baud)
-        -s             : run daemon on a given port
-        reset          : reset the board
-        bootloader     : enter bootloader mode
-        up             : press the up button (serial RTS pin)
-        pwr            : press the power button (serial DTR pin)
-        release        : release all buttons
-        pty            : get the pty path for your serial console
-        baud           : toggle the serial baud manually (115200/3000000)
-```
 
 ## Running a serial monitor
 
@@ -42,12 +24,12 @@ picocom $(rrst pty)
 
 ## Baud rates
 
-FIXME: currently the baud rates are hardcoded, 115200 when in the bootloader and
-3000000 in Linux. The bootloader -> Linux transition is detected by string
-matching against "UEFI end", the string in Qcom bootloadlers. Linux ->
-bootloader transition is triggered by the rrst `reset` and `bootloader`
-commands. The baud rate can be toggle with `rrst baud`, I recommend configuring
-these as global shortcuts in your window manager or DE.
+Baud rates can be configured in the configuration file. It's also possible to
+configure two baud rates, one for the bootloader and one for Linux. This lets
+the kernel boot a looot faster by using a high baud rate like 3000000 without
+missing out on bootloader messages. This is accomplished by doing substring
+searching on the serial output from the device and switching to the Linux baud
+rate when a match is found. The baud rate can also be toggle with `rrst baud`.
 
 ## Wiring
 
