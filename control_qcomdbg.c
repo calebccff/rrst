@@ -83,7 +83,7 @@ static int qcom_dbg_board_reset(struct rrst_msg *msg) {
 		// For boards without power control, do it the hard way
 		press_pwr();
 		press_up();
-		usleep(10500 * MS);
+		usleep(11500 * MS);
 		break;
 	}
 
