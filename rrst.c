@@ -338,6 +338,7 @@ static int handle_action(const char *port, struct rrst_action_state *state)
 		strncpy(msg.info, "ERROR: Action already in progress", sizeof(msg.info) - 1);
 		if (sendto(state->fd, &msg, sizeof(msg), 0, (struct sockaddr*)&state->addr_client, addrlen) < 0)
 			fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
+		return 0;
 	}
 
 	if (ret && ret != EBUSY) {
