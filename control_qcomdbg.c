@@ -15,14 +15,14 @@ static enum qcom_dbg_type qcom_dbg_type;
 
 #define write_byte(b) if (write(cfd, b, 1) != 1) RRST_MSG_ERR_RET(msg, "ERROR: failed to write '" b "' to control port\n")
 
-#define press_pwr() write_byte("B")
-#define release_pwr() write_byte("b")
-#define press_up() write_byte("R")
-#define release_up() write_byte("r")
-#define enable_power() write_byte("P")
-#define disable_power() write_byte("p")
-#define enable_vbus() write_byte("U")
-#define disable_vbus() write_byte("u")
+#define press_pwr() do { printf("press_pwr\n"); write_byte("B"); } while (0)
+#define release_pwr() do { printf("release_pwr\n"); write_byte("b"); } while (0)
+#define press_up() do { printf("press_up\n"); write_byte("R"); } while (0)
+#define release_up() do { printf("release_up\n"); write_byte("r"); } while (0)
+#define enable_power() do { printf("enable_power\n"); write_byte("P"); } while (0)
+#define disable_power() do { printf("disable_power\n"); write_byte("p"); } while (0)
+#define enable_vbus() do { printf("enable_vbus\n"); write_byte("U"); } while (0)
+#define disable_vbus() do { printf("disable_vbus\n"); write_byte("u"); } while (0)
 
 static void control_port_reconnect(void *data, int fd) {
 	control_port_attached = fd > 0;
@@ -45,7 +45,7 @@ static int qcom_dbg_init(struct rrst_config *config) {
 
 	printf("Using control port %s\n", control_port);
 
-	_set_baud(cfd, B9600, true);
+	_set_baud(cfd, B115200, true);
 
 	return 0;
 }
@@ -59,9 +59,8 @@ static void qcom_dbg_on_connect(bool serial_attached) {
 }
 
 static int qcom_dbg_release_btns(struct rrst_msg *msg) {
-	enable_power();
-	usleep(10 * MS);
-	enable_vbus();
+	disable_power();
+	disable_vbus();
 	release_pwr();
 	release_up();
 
@@ -69,7 +68,8 @@ static int qcom_dbg_release_btns(struct rrst_msg *msg) {
 }
 
 /* No fiddling with button combos \o/ */
-static int qcom_dbg_board_reset(struct rrst_msg *msg) {
+static int qcom_dbg_board_reset_start(struct rrst_msg *msg) {
+	print_serial("RRST: Rebooting to bootloader...");
 	switch (qcom_dbg_type) {
 	case QCOM_DBG_TYPE_NORMAL:
 		disable_power();
@@ -78,27 +78,33 @@ static int qcom_dbg_board_reset(struct rrst_msg *msg) {
 		enable_power();
 		usleep(10 * MS);
 		enable_vbus();
+		press_up();
 		break;
 	case QCOM_DBG_TYPE_NOPWR:
 		// For boards without power control, do it the hard way
 		press_pwr();
+		usleep(10500 * MS);
+		print_serial("RRST: Press up...");
 		press_up();
-		usleep(11500 * MS);
+		usleep(1000 * MS);
+		print_serial("RRST: Release pwr...");
+		release_pwr();
 		break;
 	}
 
 	RRST_MSG_ACK(msg);
 }
 
-/* Reset the board and then hold UP to get to fastboot */
-static int qcom_dbg_reset_enter_bootloader(struct rrst_msg *msg) {
-	if (qcom_dbg_board_reset(msg)) return -1;
-	press_up();
+static int qcom_dbg_board_reset(struct rrst_msg *msg) {
+	if (qcom_dbg_board_reset_start(msg)) return -1;
+	release_up();
+	print_serial("RRST: Release up");
 
-	RRST_MSG_ACK(msg);
+	return 0;
 }
 
 static int qcom_dbg_board_pwr(struct rrst_msg *msg) {
+	print_serial("RRST: Press pwr");
 	press_pwr();
 	usleep(50 * MS);
 	release_pwr();
@@ -107,6 +113,7 @@ static int qcom_dbg_board_pwr(struct rrst_msg *msg) {
 }
 
 static int qcom_dbg_board_up(struct rrst_msg *msg) {
+	print_serial("RRST: press up");
 	press_up();
 	usleep(50 * MS);
 	release_up();
@@ -119,7 +126,7 @@ struct rrst_control qcom_dbg_control = {
 	.on_connect = qcom_dbg_on_connect,
 	.release = qcom_dbg_release_btns,
 	.reset = qcom_dbg_board_reset,
-	.start_bootloader = qcom_dbg_reset_enter_bootloader,
+	.start_bootloader = qcom_dbg_board_reset_start,
 	.up = qcom_dbg_board_up,
 	.pwr = qcom_dbg_board_pwr,
 	.exit = qcom_dbg_exit,

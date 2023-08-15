@@ -15,6 +15,7 @@ enum actions {
 	RELEASE,
 	PTY,
 	BAUD,
+	TEST,
 };
 
 enum rrst_msg_type {
@@ -29,10 +30,9 @@ enum rrst_msg_type {
 
 struct rrst_msg {
 	enum rrst_msg_type type;
-	union {
-		enum actions action;
-		char info[64];
-	};
+	enum actions action;
+	char info[128];
+	char info2[128];
 };
 
 /* Common error path, set msg info str, print error and return. 
@@ -58,3 +58,4 @@ extern int ttyfd;
 extern bool quit;
 
 int _set_baud(int fd, speed_t speed, bool make_raw);
+void print_serial(const char *fmt, ...);

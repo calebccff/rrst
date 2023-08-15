@@ -128,15 +128,15 @@ reconnect:
 	if (data->has_ios)
 		ioctl(data->port_fd, TCSETSF, (char *) &data->ios);
 	
-	if (data->has_flock) {
-		ret = flock(data->port_fd, data->has_flock);
-		if (ret < 0)
-			fprintf(stderr, "flock(%d, %d) failed: %m\n", data->port_fd,
-			    data->has_flock);
-		else
-		 	dbg("flock(%d, %d) succeeded\n", data->port_fd,
-			    data->has_flock);
-	}
+	// if (data->has_flock) {
+	// 	ret = flock(data->port_fd, data->has_flock);
+	// 	if (ret < 0)
+	// 		fprintf(stderr, "flock(%d, %d) failed: %m\n", data->port_fd,
+	// 		    data->has_flock);
+	// 	else
+	// 	 	dbg("flock(%d, %d) succeeded\n", data->port_fd,
+	// 		    data->has_flock);
+	// }
 
 	if (!init) {
 		c = 0;

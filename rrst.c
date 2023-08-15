@@ -44,6 +44,8 @@ void usage() {
 	fprintf(stderr, "\trelease        : release all buttons\n");
 	fprintf(stderr, "\tpty            : get the pty path for your serial console\n");
 	fprintf(stderr, "\tbaud           : toggle the serial baud manually (115200/3000000)\n");
+	fprintf(stderr, "\ttest <pass> <fail> [timeout] : wait until either pass or fail string is found in serial output\n");
+	fprintf(stderr, "                                 exit with 0 on success, 1 on timeout, 2 on fail\n");
 }
 
 static const char *action_names[] = {
@@ -55,6 +57,15 @@ static const char *action_names[] = {
 	[RELEASE] = "release",
 	[PTY] = "pty",
 	[BAUD] = "baud",
+	[TEST] = "test",
+};
+
+struct rrst_test_state {
+	char pass[128];
+	char fail[128];
+	int fd;
+	bool in_progress;
+	struct sockaddr_un addr_client;
 };
 
 struct rrst_action_state {
@@ -68,8 +79,12 @@ struct rrst_action_state {
 	char ptyname[64];
 };
 
+static struct rrst_test_state test_state;
+
 #define NOTIFY_QUIT 0xff
 #define NOTIFY_PTY_DISCONNECT 0x01
+/* A message from the server to the PTY is pending */
+#define NOTIFY_USER_MSG 0x02
 
 int ttyfd;
 bool quit;
@@ -123,7 +138,6 @@ static bool device_is_fastboot(struct udev_device *dev) {
 
 	udev_list_entry_foreach(link, devlinks) {
 		const char *name = udev_list_entry_get_name(link);
-		//printf("link: %s\n", name);
 		if (strncmp(name, FASTBOOT_PATH, strlen(FASTBOOT_PATH)) == 0)
 			return true;
 	}
@@ -160,12 +174,15 @@ static void board_bootloader(struct udev_monitor *mon, struct rrst_msg *msg) {
 		if (dev) {
 			const char *action = udev_device_get_action(dev);
 			if (action && strcmp(action, "bind") == 0) {
-				if (device_is_fastboot(dev))
+				if (device_is_fastboot(dev)) {
+					printf("Action: %s\n", action);
 					break;
+				}
 			}
 			udev_device_unref(dev);
 		}
 	}
+
 	control.release(msg);
 }
 
@@ -218,10 +235,14 @@ static int init_socket(int *fd, struct sockaddr_un *addr)
 
 static int bind_socket(int fd, struct sockaddr_un *addr)
 {
+again:
 	if (bind(fd, (struct sockaddr *)addr, sizeof(*addr)) == -1) {
-		if (errno == EADDRINUSE)
+		if (errno == EADDRINUSE) {
 			fprintf(stderr, "Socket file '%s' already exists, is another instance running?\n",
 				addr->sun_path);
+			unlink(addr->sun_path);
+			goto again;
+		}
 		else
 			fprintf(stderr, "Failed to bind socket: %s\n", strerror(errno));
 		return -1;
@@ -290,8 +311,8 @@ static void *server_action_thread(void *data) {
 			break;
 		}
 
-		if (sendto(state->fd, &msg, sizeof(msg), 0, (struct sockaddr*)&state->addr_client, addrlen) < 0)
-			fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
+		// We don't care if this fails, it just means the client is gone
+		sendto(state->fd, &msg, sizeof(msg), 0, (struct sockaddr*)&state->addr_client, addrlen);
 		pthread_mutex_unlock(&state->mutex);
 	}
 
@@ -316,6 +337,13 @@ static int handle_action(const char *port, struct rrst_action_state *state)
 	switch (msg.type) {
 	case MSG_ACTION:
 		action = msg.action;
+		if (action == TEST) {
+			test_state.in_progress = true;
+			test_state.fd = state->fd;
+			strncpy(test_state.pass, msg.info, sizeof(test_state.pass) - 1);
+			strncpy(test_state.fail, msg.info2, sizeof(test_state.fail) - 1);
+			memcpy(&test_state.addr_client, &state->addr_client, sizeof(state->addr_client));
+		}
 		memset(&msg, 0, sizeof(msg));
 		break;
 	default:
@@ -325,9 +353,9 @@ static int handle_action(const char *port, struct rrst_action_state *state)
 
 	printf("Handling action: '%s'\n", action_names[action]);
 
-	if (action == PTY) {
+	if (action == PTY || action == TEST) {
 		msg.type = MSG_INFO;
-		strncpy(msg.info, state->ptyname, sizeof(msg.info) - 1);
+		strncpy(msg.info, action == PTY ? state->ptyname : "ACK!", sizeof(msg.info) - 1);
 		if (sendto(state->fd, &msg, sizeof(msg), 0, (struct sockaddr*)&state->addr_client, addrlen) < 0)
 			fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
 		return 0;
@@ -355,7 +383,106 @@ static int handle_action(const char *port, struct rrst_action_state *state)
 	return 0;
 }
 
-#define LINUX_TRANSITION "UEFI End"
+static void handle_test_detect(const char *line)
+{
+	struct rrst_msg msg;
+	int ret;
+
+	if (!test_state.in_progress)
+		return;
+
+	if (strstr(line, test_state.pass)) {
+		printf("Test passed!\n");
+		msg.type = MSG_INFO;
+		strncpy(msg.info, "PASS!", sizeof(msg.info) - 1);
+		ret = sendto(test_state.fd, &msg, sizeof(msg), 0, (struct sockaddr*)&test_state.addr_client, sizeof(test_state.addr_client));
+		if (ret < 0)
+			fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
+		test_state.in_progress = false;
+	} else if (strstr(line, test_state.fail)) {
+		printf("Test failed!\n");
+		msg.type = MSG_ERR;
+		strncpy(msg.info, "FAIL!", sizeof(msg.info) - 1);
+		ret = sendto(test_state.fd, &msg, sizeof(msg), 0, (struct sockaddr*)&test_state.addr_client, sizeof(test_state.addr_client));
+		if (ret < 0)
+			fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
+		test_state.in_progress = false;
+	}
+}
+
+#define MSG_QUEUE_SIZE 64
+
+static struct {
+	pthread_mutex_t mutex;
+	const char *msgs[MSG_QUEUE_SIZE];
+	int head, tail;
+} user_messages = {
+	.mutex = PTHREAD_MUTEX_INITIALIZER,
+};
+
+void print_serial(const char *fmt, ...)
+{
+	va_list args;
+	char buf[4096];
+	int len;
+
+	va_start(args, fmt);
+	len = vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+
+	if (len < 0 || len >= sizeof(buf)) {
+		fprintf(stderr, "Failed to format message\n");
+		return;
+	}
+
+	pthread_mutex_lock(&user_messages.mutex);
+	user_messages.msgs[user_messages.head] = strdup(buf);
+	user_messages.head = (user_messages.head + 1) % MSG_QUEUE_SIZE;
+	if (user_messages.head == user_messages.tail)
+		user_messages.tail = (user_messages.tail + 1) % MSG_QUEUE_SIZE;
+	pthread_mutex_unlock(&user_messages.mutex);
+
+	eventfd_write(notifyfd, NOTIFY_USER_MSG);
+}
+
+#define MSG_LINE_START "\033[34m"
+#define MSG_LINE_END "\033[0m\r\n"
+
+/* Print pending user messages (info stuff) opportunistically 
+ * unless block is true, in which case wait for the mutex.
+ */
+static int tty_print_user_messages(bool block)
+{
+	int ret = 0;
+	const char *buf;
+
+	if (!user_messages.msgs[user_messages.tail])
+		return 0;
+
+	printf("Pending msg, block %d\n", block);
+
+	if (block)
+		pthread_mutex_lock(&user_messages.mutex);
+	else if (pthread_mutex_trylock(&user_messages.mutex))
+		return 0;
+
+	while (user_messages.tail != user_messages.head) {
+		buf = user_messages.msgs[user_messages.tail];
+		if (!block)
+			write(ptyfd, "\r\n", 2);
+		write(ptyfd, MSG_LINE_START, strlen(MSG_LINE_START));
+		write(ptyfd, buf, strlen(buf));
+		write(ptyfd, MSG_LINE_END, strlen(MSG_LINE_END));
+		free((void*)buf);
+		user_messages.msgs[user_messages.tail] = NULL;
+		user_messages.tail = (user_messages.tail + 1) % MSG_QUEUE_SIZE;
+		ret++;
+	}
+
+	pthread_mutex_unlock(&user_messages.mutex);
+
+	return ret;
+}
 
 static int handle_tty(int fd)
 {
@@ -375,19 +502,28 @@ static int handle_tty(int fd)
 		return -1;
 	}
 
-	tty_line[tty_line_len++] = buf;
-	if (buf == '\n' || buf == '\r') {
-		if (current_baud == config.baud_bootloader && strstr(tty_line, LINUX_TRANSITION)) {
-			printf("Linux transition detected\n");
-			set_baud(config.baud_linux, false);
-		}
-		memset(tty_line, 0, sizeof(tty_line));
-		tty_line_len = 0;
-	}
+	if (fd == ttyfd) {
+		tty_line[tty_line_len++] = buf;
+		if (buf == '\n' || buf == '\r') {
+			if (current_baud == config.baud_bootloader && strstr(tty_line, config.linux_detect)) {
+				printf("Linux transition detected\n");
+				set_baud(config.baud_linux, false);
+			}
+			if (test_state.in_progress) {
+				handle_test_detect(tty_line);
+			}
+			memset(tty_line, 0, sizeof(tty_line));
+			tty_line_len = 0;
 
-	if (tty_line_len >= sizeof(tty_line)) {
-		memset(tty_line, 0, sizeof(tty_line));
-		tty_line_len = 0;
+			// Print pending user messages if the mutex isn't locked and
+			// we're in the ttyfd context
+			tty_print_user_messages(false);
+		}
+
+		if (tty_line_len >= sizeof(tty_line)) {
+			memset(tty_line, 0, sizeof(tty_line));
+			tty_line_len = 0;
+		}
 	}
 
 	//printf("tty: %c\n", buf);
@@ -518,6 +654,7 @@ static int server_mainloop(const char *config_path)
 	}
 
 #define N_FDS 4
+	bool user_msg_pending = false;
 	while (true) {
 		struct pollfd fds[N_FDS];
 		fds[0].fd = state.fd;
@@ -527,9 +664,12 @@ static int server_mainloop(const char *config_path)
 		for (int i = 0; i < N_FDS; i++)
 			fds[i].events = POLLIN;
 
-		//usleep(30000);
-
-		if (poll(fds, N_FDS, -1) < 0) {
+		if ((ret = poll(fds, N_FDS, 50)) <= 0) {
+			if (ret == 0) { // TIMEDOUT
+				tty_print_user_messages(true);
+				user_msg_pending = false;
+				continue;
+			}
 			fprintf(stderr, "Failed to select: %s\n", strerror(errno));
 			ret = 1;
 			goto out;
@@ -537,7 +677,6 @@ static int server_mainloop(const char *config_path)
 
 		/* state.fd */
 		if (fds[0].revents & POLLIN) {
-			printf("state.fd\n");
 			if (handle_action(config.port, &state) < 0) {
 				ret = 1;
 				goto out;
@@ -560,6 +699,13 @@ static int server_mainloop(const char *config_path)
 				break;
 			case NOTIFY_PTY_DISCONNECT:
 				printf("%s: %s\n", config.port, "Disconnected");
+				break;
+			case NOTIFY_USER_MSG:
+				printf("User message\n");
+				if (user_msg_pending)
+					tty_print_user_messages(true);
+				else
+					user_msg_pending = true;
 				break;
 			default:
 				fprintf(stderr, "Unknown notification: %lu\n", notify);
@@ -608,7 +754,7 @@ static void client_sigterm_handler(int sig)
 	close(notifyfd);
 }
 
-static int do_action(enum actions action) 
+static int do_action(enum actions action)
 {
 	struct rrst_msg msg;
 	struct sockaddr_un addr;
@@ -657,17 +803,30 @@ static int do_action(enum actions action)
 	msg.type = MSG_ACTION;
 	msg.action = action;
 
+	if (action == TEST) {
+		strncpy(msg.info, test_state.pass, sizeof(msg.info) - 1);
+		strncpy(msg.info2, test_state.fail, sizeof(msg.info2) - 1);
+	}
+
 	if (send(notifyfd, &msg, sizeof(msg), 0) == -1) {
 		fprintf(stderr, "RRST: Failed to send message, is rrst running? %s\n", strerror(errno));
 		goto out;
 	}
 
+	bool got_test_ack = false;
+
+wait_test_result:
 	memset(&msg, 0, sizeof(msg));
-	while ((len = recv(notifyfd, &msg, sizeof(msg), 0)) == -1 && (errno == EINTR || errno == EAGAIN)) {
-		usleep(1 * MS);
-		if (quit)
-			goto out;
+	struct pollfd fds[1];
+	fds[0].fd = notifyfd;
+	fds[0].events = POLLIN;
+	int timeout = action == TEST ? -1 : 15000;
+
+	if (poll(fds, 1, timeout) < 0) {
+		fprintf(stderr, "RRST: Failed to poll for response %s\n", strerror(errno));
+		goto out;
 	}
+	len = recv(notifyfd, &msg, sizeof(msg), 0);
 	if (len == -1) {
 		fprintf(stderr, "RRST: Failed to receive message, is rrst running? %s\n", strerror(errno));
 		goto out;
@@ -678,10 +837,18 @@ static int do_action(enum actions action)
 		printf("%s done!\n", action_names[action]);
 		break;
 	case MSG_ERR:
-		printf("RRST: %s\n", msg.info);
+		printf("%s\n", msg.info);
+		len = 0;
 		break;
 	case MSG_INFO:
 		printf("%s\n", msg.info);
+		if (action == TEST) {
+			if (!got_test_ack) {
+				got_test_ack = true;
+				goto wait_test_result;
+			}
+			len = 1;
+		}
 		break;
 	default:
 		printf("RRST: Unexpected response type: %d\n", msg.type);
@@ -737,10 +904,23 @@ int main(int argc, char *argv[])
 	// Invoke an action (client)
 	if (optind < argc) {
 		action = parse_action(argv[optind++]);
-	} else {
+	}
+	
+	if (action == INVALID) {
 		fprintf(stderr, "No arguments specified!\n");
 		usage();
 		return 1;
+	}
+
+	if (action == TEST) {
+		if (argc - optind < 2) {
+			fprintf(stderr, "Must specify a pass and fail string!\n");
+			usage();
+			return 1;
+		}
+
+		strncpy(test_state.pass, argv[optind++], sizeof(test_state.pass) - 1);
+		strncpy(test_state.fail, argv[optind++], sizeof(test_state.fail) - 1);
 	}
 
 	return do_action(action);
