@@ -12,6 +12,7 @@ static const char *control_port;
 static bool control_port_attached = false;
 static int cfd = -1;
 static enum qcom_dbg_type qcom_dbg_type;
+static const char *board_name;
 
 #define write_byte(b) if (write(cfd, b, 1) != 1) RRST_MSG_ERR_RET(msg, "ERROR: failed to write '" b "' to control port\n")
 
@@ -36,6 +37,7 @@ static void control_port_reconnect(void *data, int fd) {
 static int qcom_dbg_init(struct rrst_config *config) {
 	control_port = config->control_port;
 	qcom_dbg_type = config->qcom_dbg_type;
+	board_name = config->name;
 
 	cfd = tp_open(control_port, control_port_reconnect, NULL, 0);
 	if (cfd == -1) {
@@ -46,6 +48,10 @@ static int qcom_dbg_init(struct rrst_config *config) {
 	printf("Using control port %s\n", control_port);
 
 	_set_baud(cfd, B115200, true);
+
+	// Enable power all the time, just in case
+	if (qcom_dbg_type == QCOM_DBG_TYPE_NOPWR)
+		write(cfd, "P", 1);
 
 	return 0;
 }
@@ -83,7 +89,10 @@ static int qcom_dbg_board_reset_start(struct rrst_msg *msg) {
 	case QCOM_DBG_TYPE_NOPWR:
 		// For boards without power control, do it the hard way
 		press_pwr();
-		usleep(10500 * MS);
+		if (!strncmp(board_name, "axolotl", strlen("axolotl")))
+			usleep(11500 * MS);
+		else /* XXX: op6 needs more */
+			usleep(14000 * MS);
 		print_serial("RRST: Press up...");
 		press_up();
 		usleep(1000 * MS);

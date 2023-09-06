@@ -16,6 +16,7 @@ enum actions {
 	PTY,
 	BAUD,
 	TEST,
+	UART,
 };
 
 enum rrst_msg_type {

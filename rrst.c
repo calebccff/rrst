@@ -46,6 +46,7 @@ void usage() {
 	fprintf(stderr, "\tbaud           : toggle the serial baud manually (115200/3000000)\n");
 	fprintf(stderr, "\ttest <pass> <fail> [timeout] : wait until either pass or fail string is found in serial output\n");
 	fprintf(stderr, "                                 exit with 0 on success, 1 on timeout, 2 on fail\n");
+	fprintf(stderr, "\tuart <msg> <prompt>          : send <msg> to the uart and return output up to <prompt>\n");
 }
 
 static const char *action_names[] = {
@@ -58,13 +59,26 @@ static const char *action_names[] = {
 	[PTY] = "pty",
 	[BAUD] = "baud",
 	[TEST] = "test",
+	[UART] = "uart",
 };
 
 struct rrst_test_state {
 	char pass[128];
-	char fail[128];
+	union {
+		char fail[128];
+		struct {
+			char msg[128];
+			char output[32168];
+		};
+	};
 	int fd;
 	bool in_progress;
+	int send_msg : 8; /* for "UART" action, if msg should be sent to the device
+	* step 1: send the msg
+	* step 2: wait for echo
+	* step 3: echo received
+	*/
+	bool uart; /* true if UART action */
 	struct sockaddr_un addr_client;
 };
 
@@ -337,12 +351,18 @@ static int handle_action(const char *port, struct rrst_action_state *state)
 	switch (msg.type) {
 	case MSG_ACTION:
 		action = msg.action;
-		if (action == TEST) {
-			test_state.in_progress = true;
+		if (action == TEST || action == UART) {
 			test_state.fd = state->fd;
 			strncpy(test_state.pass, msg.info, sizeof(test_state.pass) - 1);
-			strncpy(test_state.fail, msg.info2, sizeof(test_state.fail) - 1);
+			if (action == TEST) {
+				strncpy(test_state.fail, msg.info2, sizeof(test_state.fail) - 1);
+			} else {
+				strncpy(test_state.msg, msg.info2, sizeof(test_state.msg) - 1);
+				test_state.send_msg = 1;
+				test_state.uart = true;
+			}
 			memcpy(&test_state.addr_client, &state->addr_client, sizeof(state->addr_client));
+			test_state.in_progress = true;
 		}
 		memset(&msg, 0, sizeof(msg));
 		break;
@@ -352,6 +372,9 @@ static int handle_action(const char *port, struct rrst_action_state *state)
 	}
 
 	printf("Handling action: '%s'\n", action_names[action]);
+
+	if (action == UART)
+		return 0;
 
 	if (action == PTY || action == TEST) {
 		msg.type = MSG_INFO;
@@ -383,6 +406,24 @@ static int handle_action(const char *port, struct rrst_action_state *state)
 	return 0;
 }
 
+static void test_pass(const char *line)
+{
+	struct rrst_msg msg = { 0 };
+	int ret;
+
+	msg.type = MSG_INFO;
+
+	/* For UART action when we get the pass prompt send a null msg */
+	if (!test_state.uart) {
+		printf("Test passed!\n");
+		strncpy(msg.info, "PASS!", sizeof(msg.info) - 1);
+	}
+	ret = sendto(test_state.fd, &msg, sizeof(msg), 0, (struct sockaddr*)&test_state.addr_client, sizeof(test_state.addr_client));
+	if (ret < 0)
+		fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
+	test_state.in_progress = false;
+}
+
 static void handle_test_detect(const char *line)
 {
 	struct rrst_msg msg;
@@ -390,16 +431,21 @@ static void handle_test_detect(const char *line)
 
 	if (!test_state.in_progress)
 		return;
-
-	if (strstr(line, test_state.pass)) {
-		printf("Test passed!\n");
+	
+	/* Send the lines back */
+	if (test_state.uart) {
 		msg.type = MSG_INFO;
-		strncpy(msg.info, "PASS!", sizeof(msg.info) - 1);
+		strncpy(msg.info, test_state.output, sizeof(msg.info) - 1);
 		ret = sendto(test_state.fd, &msg, sizeof(msg), 0, (struct sockaddr*)&test_state.addr_client, sizeof(test_state.addr_client));
-		if (ret < 0)
+		if (ret < 0) {
 			fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
-		test_state.in_progress = false;
-	} else if (strstr(line, test_state.fail)) {
+			/* Bail out */
+			test_state.in_progress = false;
+		}
+		return;
+	}
+
+	if (!test_state.uart && strstr(line, test_state.fail)) {
 		printf("Test failed!\n");
 		msg.type = MSG_ERR;
 		strncpy(msg.info, "FAIL!", sizeof(msg.info) - 1);
@@ -408,6 +454,8 @@ static void handle_test_detect(const char *line)
 			fprintf(stderr, "Failed to send reply: %s\n", strerror(errno));
 		test_state.in_progress = false;
 	}
+
+	return;
 }
 
 #define MSG_QUEUE_SIZE 64
@@ -488,8 +536,11 @@ static int handle_tty(int fd)
 {
 	static char tty_line[4096];
 	static int tty_line_len = 0;
+	static char *prompt = NULL;
 	unsigned char buf;
 	int ret, wfd;
+
+	
 
 	ret = read(fd, &buf, sizeof(buf));
 	if (ret < 0) {
@@ -504,12 +555,32 @@ static int handle_tty(int fd)
 
 	if (fd == ttyfd) {
 		tty_line[tty_line_len++] = buf;
-		if (buf == '\n' || buf == '\r') {
+		if (test_state.in_progress) {
+			if (!prompt)
+				prompt = test_state.pass;
+
+			if (*prompt == buf) {
+				prompt++;
+				if (*prompt == '\0') {
+					prompt = NULL;
+					test_pass(tty_line);
+				}
+			}
+		}
+
+		if (buf == '\n') {
 			if (current_baud == config.baud_bootloader && strstr(tty_line, config.linux_detect)) {
 				printf("Linux transition detected\n");
 				set_baud(config.baud_linux, false);
 			}
-			if (test_state.in_progress) {
+			if (test_state.send_msg == 2) {
+				if (strstr(tty_line, test_state.msg))
+					test_state.send_msg = 3;
+			} else if (test_state.in_progress) {
+				if (test_state.uart) {
+					memset(test_state.output, 0, sizeof(test_state.output));
+					strncpy(test_state.output, tty_line, sizeof(test_state.output) - 1);
+				}
 				handle_test_detect(tty_line);
 			}
 			memset(tty_line, 0, sizeof(tty_line));
@@ -668,6 +739,13 @@ static int server_mainloop(const char *config_path)
 			if (ret == 0) { // TIMEDOUT
 				tty_print_user_messages(true);
 				user_msg_pending = false;
+				if (test_state.send_msg == 1) {
+					write(ttyfd, test_state.msg, strlen(test_state.msg));
+					write(ttyfd, "\n", 1);
+					// write(ptyfd, test_state.msg, strlen(test_state.msg));
+					// write(ptyfd, "\r\n", 2);
+					test_state.send_msg = 2;
+				}
 				continue;
 			}
 			fprintf(stderr, "Failed to select: %s\n", strerror(errno));
@@ -806,6 +884,9 @@ static int do_action(enum actions action)
 	if (action == TEST) {
 		strncpy(msg.info, test_state.pass, sizeof(msg.info) - 1);
 		strncpy(msg.info2, test_state.fail, sizeof(msg.info2) - 1);
+	} else if (action == UART) {
+		strncpy(msg.info, test_state.fail, sizeof(msg.info) - 1);
+		strncpy(msg.info2, test_state.pass, sizeof(msg.info2) - 1);
 	}
 
 	if (send(notifyfd, &msg, sizeof(msg), 0) == -1) {
@@ -841,11 +922,22 @@ wait_test_result:
 		len = 0;
 		break;
 	case MSG_INFO:
-		printf("%s\n", msg.info);
+		printf("%s", msg.info);
+		if (strlen(msg.info) > 0) {
+			/* Loop until we get a null msg */
+			if (action == UART) {
+				goto wait_test_result;
+			}
+		} else if (action == UART) {
+			len = 1;
+		}
+
 		if (action == TEST) {
 			if (!got_test_ack) {
 				got_test_ack = true;
 				goto wait_test_result;
+			} else {
+				printf("\n");
 			}
 			len = 1;
 		}
@@ -912,7 +1004,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	if (action == TEST) {
+	if (action == TEST || action == UART) {
 		if (argc - optind < 2) {
 			fprintf(stderr, "Must specify a pass and fail string!\n");
 			usage();
