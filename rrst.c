@@ -569,7 +569,7 @@ static int handle_tty(int fd)
 		}
 
 		if (buf == '\n') {
-			if (current_baud == config.baud_bootloader && strstr(tty_line, config.linux_detect)) {
+			if (current_baud == config.baud_bootloader && config.linux_detect && strstr(tty_line, config.linux_detect)) {
 				printf("Linux transition detected\n");
 				set_baud(config.baud_linux, false);
 			}
