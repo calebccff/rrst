@@ -65,8 +65,8 @@ static void qcom_dbg_on_connect(bool serial_attached) {
 }
 
 static int qcom_dbg_release_btns(struct rrst_msg *msg) {
-	disable_power();
-	disable_vbus();
+	//disable_power();
+	//disable_vbus();
 	release_pwr();
 	release_up();
 
@@ -75,7 +75,7 @@ static int qcom_dbg_release_btns(struct rrst_msg *msg) {
 
 /* No fiddling with button combos \o/ */
 static int qcom_dbg_board_reset_start(struct rrst_msg *msg) {
-	print_serial("RRST: Rebooting to bootloader...");
+	print_serial("RRST: Resetting device...");
 	switch (qcom_dbg_type) {
 	case QCOM_DBG_TYPE_NORMAL:
 		disable_power();
@@ -107,6 +107,7 @@ static int qcom_dbg_board_reset_start(struct rrst_msg *msg) {
 static int qcom_dbg_board_reset(struct rrst_msg *msg) {
 	if (qcom_dbg_board_reset_start(msg)) return -1;
 	release_up();
+	disable_vbus();
 	print_serial("RRST: Release up");
 
 	return 0;
