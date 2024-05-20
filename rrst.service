@@ -3,7 +3,7 @@ Description=UART RTS/DTR button control
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/rrst -d -c %h/.config/rrst/axolotl.ini
+ExecStart=/usr/local/bin/rrst -d -c %h/.config/rrst/rb2.ini
 ExecStop=killall rrst
 Restart=always
 KillMode=control-group
