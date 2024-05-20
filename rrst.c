@@ -1,4 +1,4 @@
-/* From https://github.com/freedomlives/RTS-DTR-Pin-Control-Linux/blob/master/serial_rts_dtr.c */
+// SPDX-License-Identifier: GPL-2.0+
 
 #define _GNU_SOURCE
 #include <stdio.h>
